@@ -4,7 +4,6 @@ import random
 import re
 import threading
 import time
-from contextlib import contextmanager
 from enum import Enum
 from hashlib import md5
 from typing import Self, Optional, Literal
@@ -13,7 +12,6 @@ import requests
 from loguru import logger
 from requests import RequestException
 from requests.adapters import HTTPAdapter
-from tqdm import tqdm
 
 from api.answer import *
 from api.answer_check import cut
@@ -112,23 +110,6 @@ class StudyResult(Enum):
         return self != StudyResult.SUCCESS
 
 
-class ProgressSlotManager:
-    _lock = threading.Lock()
-    _next_position = 0
-
-    @classmethod
-    @contextmanager
-    def slot(cls):
-        with cls._lock:
-            position = cls._next_position
-            cls._next_position += 1
-
-        try:
-            yield position
-        finally:
-            pass
-
-
 def _display_width(text: str) -> int:
     width = 0
     for char in text:
@@ -166,15 +147,32 @@ def _format_video_time(seconds: float | int | None) -> str:
     return f"{mins:02d}:{sec:02d}"
 
 
-class VideoProgress(tqdm):
-    @property
-    def format_dict(self):
-        data = super().format_dict
-        data["time_fmt"] = (
-            f"{_format_video_time(data.get('n'))}/"
-            f"{_format_video_time(data.get('total'))}"
+class VideoProgressReporter:
+    def __init__(self, name: str, duration: int, initial: int = 0):
+        self.name = _shorten_desc(name, max_width=64)
+        self.duration = max(duration, 1)
+        self.last_report_at = 0.0
+        self.last_percent = -1
+        self.report(initial, force=True)
+
+    def report(self, play_time: float | int, force: bool = False):
+        play_time = min(max(int(play_time), 0), self.duration)
+        percent = int(play_time * 100 / self.duration)
+        now = time.time()
+
+        if not force and percent < 100:
+            if now - self.last_report_at < 30 and percent < self.last_percent + 5:
+                return
+
+        self.last_report_at = now
+        self.last_percent = percent
+        logger.info(
+            "视频进度: {} {}% ({}/{})",
+            self.name,
+            percent,
+            _format_video_time(play_time),
+            _format_video_time(self.duration),
         )
-        return data
 
 
 class Chaoxing:
@@ -551,87 +549,66 @@ class Chaoxing:
 
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
 
-        with ProgressSlotManager.slot() as progress_position:
-            pbar = VideoProgress(
-                total=duration,
-                initial=play_time,
-                desc=_shorten_desc(_job["name"]),
-                position=progress_position,
-                leave=True,
-                dynamic_ncols=True,
-                mininterval=0.5,
-                bar_format="{desc}: {percentage:3.0f}%|{bar}| {time_fmt}",
-            )
+        progress = VideoProgressReporter(_job["name"], duration, play_time)
+        forbidden_retry = 0
+        max_forbidden_retry = 2
 
-            try:
-                forbidden_retry = 0
-                max_forbidden_retry = 2
+        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type,headers=headers)
+        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers=headers)
 
-                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type,headers=headers)
-                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers=headers)
+        if passed:
+            progress.report(duration, force=True)
+            logger.info("任务瞬间完成: {}", _job['name'])
+            return StudyResult.SUCCESS
 
-                if passed:
-                    pbar.n = duration
-                    pbar.refresh()
-                    pbar.close()
-                    logger.info("任务瞬间完成: {}", _job['name'])
-                    return StudyResult.SUCCESS
+        while not passed and not self.is_stopped():
+            # Sometimes the last request needs to be sent several times to complete the task
+            if play_time - last_log_time >= wait_time or play_time == duration:
 
-                while not passed and not self.is_stopped():
-                    # Sometimes the last request needs to be sent several times to complete the task
-                    if play_time - last_log_time >= wait_time or play_time == duration:
+                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
+                                                        int(play_time), _type, headers=headers)
 
-                        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
-                                                                int(play_time), _type, headers=headers)
-
-                        if state == 403:
-                            if forbidden_retry >= max_forbidden_retry:
-                                pbar.close()
-                                logger.warning("403重试失败, 跳过当前任务")
-                                return StudyResult.FORBIDDEN
-                            forbidden_retry += 1
-                            logger.warning(
-                                "出现403报错, 正在尝试刷新会话状态 (第{}次)",
-                                forbidden_retry,
-                            )
-                            if self.stop_event.wait(random.uniform(2, 4)):
-                                return StudyResult.ERROR
-                            refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
-                            if refreshed_meta:
-                                # FIXME: Maybe it should be considered an error if those keys aren't present in the refreshed meta, so we perhaps shouldn't use get()
-                                _dtoken = refreshed_meta.get("dtoken", _dtoken)
-                                _duration = refreshed_meta.get("duration", duration)
-                                play_time = refreshed_meta.get("playTime", play_time)
-
-                                logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
-                                continue
-
-                        elif not passed and state != 200:
-                            pbar.close()
-                            return StudyResult.ERROR
-
-                        wait_time = int(random.uniform(30, 90))
-                        last_log_time = play_time
-
-                    dt = (time.time() - last_iter) * _speed # Since uploading the progress takes time, we assume that the video is still playing in the background, so manually calculate the time elapsed is required
-                    last_iter = time.time()
-                    play_time = min(duration, play_time+dt)
-
-                    pbar.n = int(play_time)
-                    pbar.refresh()
-                    if self.stop_event.wait(gc.THRESHOLD):
+                if state == 403:
+                    if forbidden_retry >= max_forbidden_retry:
+                        logger.warning("403重试失败, 跳过当前任务")
+                        return StudyResult.FORBIDDEN
+                    forbidden_retry += 1
+                    logger.warning(
+                        "出现403报错, 正在尝试刷新会话状态 (第{}次)",
+                        forbidden_retry,
+                    )
+                    if self.stop_event.wait(random.uniform(2, 4)):
                         return StudyResult.ERROR
+                    refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
+                    if refreshed_meta:
+                        # FIXME: Maybe it should be considered an error if those keys aren't present in the refreshed meta, so we perhaps shouldn't use get()
+                        _dtoken = refreshed_meta.get("dtoken", _dtoken)
+                        _duration = refreshed_meta.get("duration", duration)
+                        play_time = refreshed_meta.get("playTime", play_time)
 
-                if self.is_stopped():
+                        logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
+                        continue
+
+                elif not passed and state != 200:
                     return StudyResult.ERROR
 
-                pbar.n = duration
-                pbar.refresh()
-                pbar.close()
-                logger.info("任务完成: {}", _job['name'])
-                return StudyResult.SUCCESS
-            finally:
-                pbar.close()
+                wait_time = int(random.uniform(30, 90))
+                last_log_time = play_time
+
+            dt = (time.time() - last_iter) * _speed # Since uploading the progress takes time, we assume that the video is still playing in the background, so manually calculate the time elapsed is required
+            last_iter = time.time()
+            play_time = min(duration, play_time+dt)
+
+            progress.report(play_time)
+            if self.stop_event.wait(gc.THRESHOLD):
+                return StudyResult.ERROR
+
+        if self.is_stopped():
+            return StudyResult.ERROR
+
+        progress.report(duration, force=True)
+        logger.info("任务完成: {}", _job['name'])
+        return StudyResult.SUCCESS
 
     def study_document(self, _course, _job) -> StudyResult:
         """
