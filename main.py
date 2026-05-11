@@ -8,11 +8,12 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import Future, as_completed
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from queue import PriorityQueue, ShutDown
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 from tqdm import tqdm
 
@@ -23,6 +24,8 @@ from api.logger import logger
 from api.notification import Notification
 from api.live import Live
 from api.live_process import LiveProcessor
+
+VIDEO_TASK_TYPES = {"video", "live"}
 
 _active_chaoxing: Chaoxing | None = None
 _interrupt_lock = threading.Lock()
@@ -98,7 +101,19 @@ def parse_args():
         "-s", "--speed", type=float, default=1.0, help="视频播放倍速 (默认1, 最大2)"
     )
     parser.add_argument(
-        "-j", "--jobs", type=int, default=4, help="同时进行的章节数 (默认4, 如果一个章节有多个任务点，不会限制同时处理任务点的数量)"
+        "-j",
+        "--jobs",
+        "--text-jobs",
+        dest="text_jobs",
+        type=int,
+        default=4,
+        help="同时进行的章节/文本任务数 (默认4)",
+    )
+    parser.add_argument(
+        "--video-jobs",
+        type=int,
+        default=None,
+        help="同时进行的视频/直播任务数 (默认 max(jobs*4, jobs))",
     )
 
     parser.add_argument(
@@ -140,8 +155,14 @@ def load_config_from_file(config_path):
         # 处理speed，将字符串转换为浮点数
         if "speed" in common_config:
             common_config["speed"] = float(common_config["speed"])
-        if "jobs" in common_config:
+        if "text_jobs" in common_config and common_config["text_jobs"]:
+            common_config["text_jobs"] = int(common_config["text_jobs"])
+            common_config["jobs"] = common_config["text_jobs"]
+        elif "jobs" in common_config:
             common_config["jobs"] = int(common_config["jobs"])
+            common_config["text_jobs"] = common_config["jobs"]
+        if "video_jobs" in common_config and common_config["video_jobs"]:
+            common_config["video_jobs"] = int(common_config["video_jobs"])
         # 处理notopen_action，设置默认值为retry
         if "notopen_action" not in common_config:
             common_config["notopen_action"] = "retry"
@@ -175,7 +196,9 @@ def build_config_from_args(args):
         "password": args.password,
         "course_list": [item.strip() for item in args.list.split(",") if item.strip()] if args.list else None,
         "speed": args.speed if args.speed else 1.0,
-        "jobs": args.jobs,
+        "jobs": args.text_jobs,
+        "text_jobs": args.text_jobs,
+        "video_jobs": args.video_jobs,
         "notopen_action": args.notopen_action if args.notopen_action else "retry"
     }
     return common_config, {}, {}
@@ -318,26 +341,53 @@ def format_task_title(task: ChapterTask) -> str:
     return f"{task.course.get('title', '未知课程')} / {task.point.get('title', '未知章节')}"
 
 
+def format_job_title(course: dict[str, Any], job: dict[str, Any]) -> str:
+    job_name = job.get("name") or job.get("title") or job.get("jobid") or "未知任务"
+    return f"{course.get('title', '未知课程')} / {job_name}"
+
+
+def positive_int(value: Any, default: int) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
 class JobProcessor:
     def __init__(self, chaoxing: Chaoxing, tasks: list[ChapterTask], config: dict[str, Any]):
-        if "jobs" not in config or not config["jobs"]:
+        if "text_jobs" in config and config["text_jobs"]:
+            config["jobs"] = positive_int(config["text_jobs"], 4)
+        elif "jobs" not in config or not config["jobs"]:
             config["jobs"] = 4
+        else:
+            config["jobs"] = positive_int(config["jobs"], 4)
         
         self.chaoxing = chaoxing
         self.speed = config["speed"]
         self.max_tries = 5
         self.tasks = tasks
         self.failed_tasks: list[ChapterTask] = []
+        self.failed_video_jobs: list[str] = []
+        self.failed_video_jobs_lock = threading.Lock()
         self.task_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.retry_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.wait_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.threads: list[threading.Thread] = []
         self.worker_num = config["jobs"]
+        self.video_worker_num = positive_int(
+            config.get("video_jobs"),
+            max(self.worker_num * 4, self.worker_num),
+        )
+        self.video_executor = ThreadPoolExecutor(max_workers=self.video_worker_num, thread_name_prefix="video")
+        self.video_futures: list[Future] = []
+        self.video_futures_lock = threading.Lock()
         self.config = config
 
     def run(self):
         for task in self.tasks:
             self.task_queue.put(task)
+
+        logger.info("文本/章节并发数: {}, 视频/直播并发数: {}", self.worker_num, self.video_worker_num)
 
         for i in range(self.worker_num):
             thread = threading.Thread(target=self.worker_thread, daemon=True)
@@ -348,16 +398,64 @@ class JobProcessor:
 
         try:
             self.task_queue.join()
+            self.wait_video_jobs()
             time.sleep(0.5)
         except KeyboardInterrupt:
             logger.warning("收到中断信号，正在停止当前课程任务...")
             self.chaoxing.request_stop()
             self.task_queue.shutdown(immediate=True)
             self.retry_queue.shutdown(immediate=True)
+            self.video_executor.shutdown(wait=False, cancel_futures=True)
             raise
         else:
             self.task_queue.shutdown()
             self.retry_queue.shutdown()
+            self.video_executor.shutdown(wait=True)
+            if self.failed_video_jobs:
+                logger.error("视频/直播任务失败数量: {}", len(self.failed_video_jobs))
+
+    def submit_video_job(self, course: dict[str, Any], job: dict[str, Any], job_info: dict[str, Any]):
+        if self.chaoxing.is_stopped():
+            return
+
+        future = self.video_executor.submit(self.run_video_job, course, job, job_info)
+        with self.video_futures_lock:
+            self.video_futures.append(future)
+
+    def run_video_job(self, course: dict[str, Any], job: dict[str, Any], job_info: dict[str, Any]) -> StudyResult:
+        title = format_job_title(course, job)
+
+        for attempt in range(1, self.max_tries + 1):
+            if self.chaoxing.is_stopped():
+                return StudyResult.ERROR
+
+            result = process_job(self.chaoxing, course, job, job_info, self.speed)
+            if result.is_success():
+                return result
+
+            if attempt < self.max_tries:
+                logger.warning("Retrying video task {} ({}/{} attempts)", title, attempt, self.max_tries)
+
+        logger.error("Max retries reached for video task: {}", title)
+        with self.failed_video_jobs_lock:
+            self.failed_video_jobs.append(title)
+        return StudyResult.ERROR
+
+    def wait_video_jobs(self):
+        with self.video_futures_lock:
+            futures = list(self.video_futures)
+
+        if not futures:
+            return
+
+        logger.info("等待视频/直播任务完成，任务数量: {}", len(futures))
+        for future in as_completed(futures):
+            if self.chaoxing.is_stopped():
+                return
+            try:
+                future.result()
+            except Exception as e:
+                logger.error("视频/直播任务线程异常: {}", e)
 
 
     @log_error
@@ -373,7 +471,7 @@ class JobProcessor:
                 logger.info("Queue shut down")
                 return
 
-            task.result = process_chapter(self.chaoxing, task.course, task.point, self.speed)
+            task.result = process_chapter(self.chaoxing, task.course, task.point, self.speed, self.submit_video_job)
 
             if self.chaoxing.is_stopped():
                 self.task_queue.task_done()
@@ -436,7 +534,13 @@ class JobProcessor:
             pass
 
 
-def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, Any], speed:float) -> ChapterResult:
+def process_chapter(
+    chaoxing: Chaoxing,
+    course: dict[str, Any],
+    point: dict[str, Any],
+    speed: float,
+    submit_video_job: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None] | None = None,
+) -> ChapterResult:
     """处理单个章节"""
     if chaoxing.is_stopped():
         return ChapterResult.ERROR
@@ -461,13 +565,22 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     if not jobs:
         pass
 
-    # TODO: 个别章节很恶心，多到5个点，可以并行处理，将来会让不同课程不同章节的所有任务点共享一个队列，从而实现全局并行
+    video_jobs = [job for job in jobs if job.get("type") in VIDEO_TASK_TYPES]
+    text_jobs = [job for job in jobs if job.get("type") not in VIDEO_TASK_TYPES]
+
+    for job in video_jobs:
+        if submit_video_job is None:
+            text_jobs.append(job)
+            continue
+        submit_video_job(course, job, job_info)
+
     job_results:list[StudyResult]=[]
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for result in executor.map(lambda job: process_job(chaoxing, course, job, job_info, speed), jobs):
-            job_results.append(result)
-            if chaoxing.is_stopped():
-                return ChapterResult.ERROR
+    if text_jobs:
+        with ThreadPoolExecutor(max_workers=min(5, len(text_jobs))) as executor:
+            for result in executor.map(lambda job: process_job(chaoxing, course, job, job_info, speed), text_jobs):
+                job_results.append(result)
+                if chaoxing.is_stopped():
+                    return ChapterResult.ERROR
     
     for result in job_results:
         if result.is_failure():
@@ -536,7 +649,9 @@ def process_courses(chaoxing: Chaoxing, courses: list[dict[str, Any]], config: d
         logger.info("没有需要处理的章节任务")
         return
 
-    logger.info(f"全局章节任务数量: {len(tasks)}, 全局并发数: {config.get('jobs', 4)}")
+    text_jobs = positive_int(config.get("text_jobs") or config.get("jobs"), 4)
+    video_jobs = positive_int(config.get("video_jobs"), max(text_jobs * 4, text_jobs))
+    logger.info(f"全局章节任务数量: {len(tasks)}, 文本并发数: {text_jobs}, 视频并发数: {video_jobs}")
     p = JobProcessor(chaoxing, tasks, config)
     p.run()
 
