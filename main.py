@@ -2,6 +2,8 @@
 import argparse
 import configparser
 import enum
+import os
+import signal
 import sys
 import threading
 import time
@@ -21,6 +23,34 @@ from api.logger import logger
 from api.notification import Notification
 from api.live import Live
 from api.live_process import LiveProcessor
+
+_active_chaoxing: Chaoxing | None = None
+_interrupt_lock = threading.Lock()
+_interrupt_count = 0
+
+
+def force_exit_on_interrupt(signum=None, frame=None):
+    global _interrupt_count
+
+    with _interrupt_lock:
+        _interrupt_count += 1
+
+    if _active_chaoxing is not None:
+        _active_chaoxing.request_stop()
+
+    print("\n收到中断信号，正在强制退出...", file=sys.stderr, flush=True)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        os._exit(130)
+
+
+def install_interrupt_handlers():
+    signal.signal(signal.SIGINT, force_exit_on_interrupt)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, force_exit_on_interrupt)
+
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
@@ -528,6 +558,9 @@ def format_time(num, suffix='', divisor=''):
 
 def main():
     """主程序入口"""
+    global _active_chaoxing
+
+    install_interrupt_handlers()
     chaoxing = None
     notification = Notification()
     try:
@@ -540,6 +573,7 @@ def main():
         
         # 初始化超星实例
         chaoxing = init_chaoxing(common_config, tiku_config)
+        _active_chaoxing = chaoxing
         
         # 设置外部通知
         notification.config_set(notification_config)
@@ -573,7 +607,7 @@ def main():
         if chaoxing is not None:
             chaoxing.request_stop()
         logger.error(f"错误: 程序被用户手动中断, {e}")
-        sys.exit(130)
+        force_exit_on_interrupt()
     except BaseException as e:
         logger.error(f"错误: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
