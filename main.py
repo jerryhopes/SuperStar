@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import PriorityQueue, ShutDown
 from threading import RLock
 from typing import Any
@@ -305,18 +305,25 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
 
 @dataclass(order=True)
 class ChapterTask:
-    index: int
-    point: dict[str, Any]
-    result: ChapterResult = ChapterResult.PENDING
-    tries: int = 0
+    sort_index: int
+    course_index: int = field(compare=False)
+    point_index: int = field(compare=False)
+    course: dict[str, Any] = field(compare=False)
+    point: dict[str, Any] = field(compare=False)
+    result: ChapterResult = field(default=ChapterResult.PENDING, compare=False)
+    tries: int = field(default=0, compare=False)
+
+
+def format_task_title(task: ChapterTask) -> str:
+    return f"{task.course.get('title', '未知课程')} / {task.point.get('title', '未知章节')}"
+
 
 class JobProcessor:
-    def __init__(self, chaoxing: Chaoxing, course: dict[str, Any], tasks: list[ChapterTask], config: dict[str, Any]):
+    def __init__(self, chaoxing: Chaoxing, tasks: list[ChapterTask], config: dict[str, Any]):
         if "jobs" not in config or not config["jobs"]:
             config["jobs"] = 4
         
         self.chaoxing = chaoxing
-        self.course = course
         self.speed = config["speed"]
         self.max_tries = 5
         self.tasks = tasks
@@ -366,7 +373,7 @@ class JobProcessor:
                 logger.info("Queue shut down")
                 return
 
-            task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+            task.result = process_chapter(self.chaoxing, task.course, task.point, self.speed)
 
             if self.chaoxing.is_stopped():
                 self.task_queue.task_done()
@@ -374,14 +381,14 @@ class JobProcessor:
 
             match task.result:
                 case ChapterResult.SUCCESS:
-                    logger.debug("Task success: {}", task.point["title"])
+                    logger.debug("Task success: {}", format_task_title(task))
                     self.task_queue.task_done()
                     logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
 
                 case ChapterResult.NOT_OPEN:
                     # task.tries += 1
                     if self.config["notopen_action"] == "continue":
-                        logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
+                        logger.warning("章节未开启: {}, 正在跳过", format_task_title(task))
                         self.task_queue.task_done()
                         continue
 
@@ -389,7 +396,7 @@ class JobProcessor:
                         logger.error(
                             "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
                             "请手动检查完成并提交再重试。或者在配置中配置(自动跳过关闭章节/开启题库并启用提交)"
-                        , task.point["title"])
+                        , format_task_title(task))
                         self.task_queue.task_done()
                         continue
 
@@ -398,17 +405,17 @@ class JobProcessor:
 
                 case ChapterResult.ERROR:
                     task.tries += 1
-                    logger.warning("Retrying task {} ({}/{} attempts)", task.point["title"], task.tries,
+                    logger.warning("Retrying task {} ({}/{} attempts)", format_task_title(task), task.tries,
                                    self.max_tries)
                     if task.tries >= self.max_tries:
-                        logger.error("Max retries reached for task: {}", task.point["title"])
+                        logger.error("Max retries reached for task: {}", format_task_title(task))
                         self.failed_tasks.append(task)
                         self.task_queue.task_done()
                         continue
                     self.retry_queue.put(task)
 
                 case _:
-                    logger.error("Invalid task state {} for task {}", task.result, task.point["title"])
+                    logger.error("Invalid task state {} for task {}", task.result, format_task_title(task))
                     self.failed_tasks.append(task)
                     self.task_queue.task_done()
 
@@ -475,6 +482,70 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     if chaoxing.is_stopped():
         return
 
+    process_courses(chaoxing, [course], config)
+
+
+def build_global_chapter_tasks(chaoxing: Chaoxing, courses: list[dict[str, Any]]) -> list[ChapterTask]:
+    """读取所有课程章节，并按课程轮转生成全局章节任务队列。"""
+    course_points: list[tuple[int, dict[str, Any], list[dict[str, Any]]]] = []
+
+    for course_index, course in enumerate(courses):
+        if chaoxing.is_stopped():
+            break
+
+        logger.info(f"开始读取课程章节: {course['title']}")
+        point_list = chaoxing.get_course_point(
+            course["courseId"], course["clazzId"], course["cpi"]
+        )
+        points = point_list.get("points", [])
+        logger.info(f"课程章节读取完成: {course['title']}, 章节数量: {len(points)}")
+        course_points.append((course_index, course, points))
+
+    tasks: list[ChapterTask] = []
+    sort_index = 0
+    max_point_count = max((len(points) for _, _, points in course_points), default=0)
+
+    for point_index in range(max_point_count):
+        for course_index, course, points in course_points:
+            if point_index >= len(points):
+                continue
+
+            tasks.append(
+                ChapterTask(
+                    sort_index=sort_index,
+                    course_index=course_index,
+                    point_index=point_index,
+                    course=course,
+                    point=points[point_index],
+                )
+            )
+            sort_index += 1
+
+    return tasks
+
+
+def process_courses(chaoxing: Chaoxing, courses: list[dict[str, Any]], config: dict):
+    """处理多个课程，使用全局章节队列控制总并发数。"""
+    if chaoxing.is_stopped():
+        return
+
+    tqdm.set_lock(RLock())
+
+    tasks = build_global_chapter_tasks(chaoxing, courses)
+    if not tasks:
+        logger.info("没有需要处理的章节任务")
+        return
+
+    logger.info(f"全局章节任务数量: {len(tasks)}, 全局并发数: {config.get('jobs', 4)}")
+    p = JobProcessor(chaoxing, tasks, config)
+    p.run()
+
+
+def process_course_legacy(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
+    """旧版单课程处理逻辑，仅保留作调试参考。"""
+    if chaoxing.is_stopped():
+        return
+
     logger.info(f"开始学习课程: {course['title']}")
     
     # 获取当前课程的所有章节
@@ -489,9 +560,9 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     tasks=[]
 
     for i, point in enumerate(point_list["points"]):
-        task = ChapterTask(point=point, index=i)
+        task = ChapterTask(sort_index=i, course_index=0, point_index=i, course=course, point=point)
         tasks.append(task)
-    p = JobProcessor(chaoxing, course, tasks, config)
+    p = JobProcessor(chaoxing, tasks, config)
     p.run()
 
 
@@ -593,8 +664,7 @@ def main():
         
         # 开始学习
         logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
-        for course in course_task:
-            process_course(chaoxing, course, common_config)
+        process_courses(chaoxing, course_task, common_config)
         
         logger.info("所有课程学习任务已完成")
         notification.send("chaoxing : 所有课程学习任务已完成")
