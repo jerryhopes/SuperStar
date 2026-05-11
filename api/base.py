@@ -114,24 +114,19 @@ class StudyResult(Enum):
 
 class ProgressSlotManager:
     _lock = threading.Lock()
-    _free_positions: list[int] = []
     _next_position = 0
 
     @classmethod
     @contextmanager
     def slot(cls):
         with cls._lock:
-            if cls._free_positions:
-                position = cls._free_positions.pop()
-            else:
-                position = cls._next_position
-                cls._next_position += 1
+            position = cls._next_position
+            cls._next_position += 1
 
         try:
             yield position
         finally:
-            with cls._lock:
-                cls._free_positions.append(position)
+            pass
 
 
 def _display_width(text: str) -> int:
@@ -562,7 +557,7 @@ class Chaoxing:
                 initial=play_time,
                 desc=_shorten_desc(_job["name"]),
                 position=progress_position,
-                leave=False,
+                leave=True,
                 dynamic_ncols=True,
                 mininterval=0.5,
                 bar_format="{desc}: {percentage:3.0f}%|{bar}| {time_fmt}",
