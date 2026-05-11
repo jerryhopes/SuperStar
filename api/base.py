@@ -4,6 +4,7 @@ import random
 import re
 import threading
 import time
+from contextlib import contextmanager
 from enum import Enum
 from hashlib import md5
 from typing import Self, Optional, Literal
@@ -110,6 +111,77 @@ class StudyResult(Enum):
     def is_failure(self):
         return self != StudyResult.SUCCESS
 
+
+class ProgressSlotManager:
+    _lock = threading.Lock()
+    _free_positions: list[int] = []
+    _next_position = 0
+
+    @classmethod
+    @contextmanager
+    def slot(cls):
+        with cls._lock:
+            if cls._free_positions:
+                position = cls._free_positions.pop()
+            else:
+                position = cls._next_position
+                cls._next_position += 1
+
+        try:
+            yield position
+        finally:
+            with cls._lock:
+                cls._free_positions.append(position)
+
+
+def _display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        width += 2 if ord(char) > 127 else 1
+    return width
+
+
+def _shorten_desc(text: str, max_width: int = 42) -> str:
+    if _display_width(text) <= max_width:
+        return text
+
+    result = []
+    width = 0
+    for char in text:
+        char_width = 2 if ord(char) > 127 else 1
+        if width + char_width > max_width - 3:
+            break
+        result.append(char)
+        width += char_width
+    return "".join(result) + "..."
+
+
+def _format_video_time(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "??:??"
+
+    total_time = round(seconds)
+    sec = total_time % 60
+    mins = (total_time % 3600) // 60
+    hrs = total_time // 3600
+
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{sec:02d}"
+
+    return f"{mins:02d}:{sec:02d}"
+
+
+class VideoProgress(tqdm):
+    @property
+    def format_dict(self):
+        data = super().format_dict
+        data["time_fmt"] = (
+            f"{_format_video_time(data.get('n'))}/"
+            f"{_format_video_time(data.get('total'))}"
+        )
+        return data
+
+
 class Chaoxing:
     def __init__(self, account: Account = None, tiku: Tiku = None, **kwargs):
         self.account = account
@@ -117,8 +189,15 @@ class Chaoxing:
         self.tiku = tiku
         self.kwargs = kwargs
         self.rollback_times = 0
+        self.stop_event = threading.Event()
         self.rate_limiter = RateLimiter(0.5) # 其他接口速率限制比较松
         self.video_log_limiter = RateLimiter(2) # 上报进度极其容易卡验证码，限制2s一次
+
+    def request_stop(self):
+        self.stop_event.set()
+
+    def is_stopped(self) -> bool:
+        return self.stop_event.is_set()
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -294,6 +373,8 @@ class Chaoxing:
             _type: str = "Video",
             headers: Optional[dict] = None,
     ) -> tuple[bool, int]:
+        if self.is_stopped():
+            return False, 499
 
         if headers is None:
             logger.warning("null headers")
@@ -446,6 +527,9 @@ class Chaoxing:
 
 
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0, _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
+        if self.is_stopped():
+            return StudyResult.ERROR
+
         _session = SessionManager.get_session()
 
         headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
@@ -472,65 +556,87 @@ class Chaoxing:
 
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
 
-        pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
-                    unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
+        with ProgressSlotManager.slot() as progress_position:
+            pbar = VideoProgress(
+                total=duration,
+                initial=play_time,
+                desc=_shorten_desc(_job["name"]),
+                position=progress_position,
+                leave=False,
+                dynamic_ncols=True,
+                mininterval=0.5,
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| {time_fmt}",
+            )
 
-        forbidden_retry = 0
-        max_forbidden_retry = 2
+            try:
+                forbidden_retry = 0
+                max_forbidden_retry = 2
 
-        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type,headers=headers)
-        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers=headers)
+                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type,headers=headers)
+                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers=headers)
 
-        if passed:
-            logger.info("任务瞬间完成: {}", _job['name'])
-            return StudyResult.SUCCESS
+                if passed:
+                    pbar.n = duration
+                    pbar.refresh()
+                    pbar.close()
+                    logger.info("任务瞬间完成: {}", _job['name'])
+                    return StudyResult.SUCCESS
 
-        while not passed:
-            # Sometimes the last request needs to be sent several times to complete the task
-            if play_time - last_log_time >= wait_time or play_time == duration:
+                while not passed and not self.is_stopped():
+                    # Sometimes the last request needs to be sent several times to complete the task
+                    if play_time - last_log_time >= wait_time or play_time == duration:
 
-                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
-                                                        int(play_time), _type, headers=headers)
+                        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
+                                                                int(play_time), _type, headers=headers)
 
-                if state == 403:
-                    if forbidden_retry >= max_forbidden_retry:
-                        logger.warning("403重试失败, 跳过当前任务")
-                        return StudyResult.FORBIDDEN
-                    forbidden_retry += 1
-                    logger.warning(
-                        "出现403报错, 正在尝试刷新会话状态 (第{}次)",
-                        forbidden_retry,
-                    )
-                    time.sleep(random.uniform(2, 4))
-                    refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
-                    if refreshed_meta:
-                        # FIXME: Maybe it should be considered an error if those keys aren't present in the refreshed meta, so we perhaps shouldn't use get()
-                        _dtoken = refreshed_meta.get("dtoken", _dtoken)
-                        _duration = refreshed_meta.get("duration", duration)
-                        play_time = refreshed_meta.get("playTime", play_time)
+                        if state == 403:
+                            if forbidden_retry >= max_forbidden_retry:
+                                pbar.close()
+                                logger.warning("403重试失败, 跳过当前任务")
+                                return StudyResult.FORBIDDEN
+                            forbidden_retry += 1
+                            logger.warning(
+                                "出现403报错, 正在尝试刷新会话状态 (第{}次)",
+                                forbidden_retry,
+                            )
+                            if self.stop_event.wait(random.uniform(2, 4)):
+                                return StudyResult.ERROR
+                            refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
+                            if refreshed_meta:
+                                # FIXME: Maybe it should be considered an error if those keys aren't present in the refreshed meta, so we perhaps shouldn't use get()
+                                _dtoken = refreshed_meta.get("dtoken", _dtoken)
+                                _duration = refreshed_meta.get("duration", duration)
+                                play_time = refreshed_meta.get("playTime", play_time)
 
-                        logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
-                        continue
+                                logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
+                                continue
 
-                elif not passed and state != 200:
+                        elif not passed and state != 200:
+                            pbar.close()
+                            return StudyResult.ERROR
+
+                        wait_time = int(random.uniform(30, 90))
+                        last_log_time = play_time
+
+                    dt = (time.time() - last_iter) * _speed # Since uploading the progress takes time, we assume that the video is still playing in the background, so manually calculate the time elapsed is required
+                    last_iter = time.time()
+                    play_time = min(duration, play_time+dt)
+
+                    pbar.n = int(play_time)
+                    pbar.refresh()
+                    if self.stop_event.wait(gc.THRESHOLD):
+                        return StudyResult.ERROR
+
+                if self.is_stopped():
                     return StudyResult.ERROR
 
-
-
-
-                wait_time = int(random.uniform(30, 90))
-                last_log_time = play_time
-
-            dt = (time.time() - last_iter) * _speed # Since uploading the progress takes time, we assume that the video is still playing in the background, so manually calculate the time elapsed is required
-            last_iter = time.time()
-            play_time = min(duration, play_time+dt)
-
-            pbar.n = int(play_time)
-            pbar.refresh()
-            time.sleep(gc.THRESHOLD)
-
-        logger.info("任务完成: {}", _job['name'])
-        return StudyResult.SUCCESS
+                pbar.n = duration
+                pbar.refresh()
+                pbar.close()
+                logger.info("任务完成: {}", _job['name'])
+                return StudyResult.SUCCESS
+            finally:
+                pbar.close()
 
     def study_document(self, _course, _job) -> StudyResult:
         """

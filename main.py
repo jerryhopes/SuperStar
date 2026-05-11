@@ -207,6 +207,9 @@ def init_chaoxing(common_config, tiku_config):
 
 def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float) -> StudyResult:
     """处理单个任务点"""
+    if chaoxing.is_stopped():
+        return StudyResult.ERROR
+
     # 视频任务
     if job["type"] == "video":
         logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
@@ -306,15 +309,27 @@ class JobProcessor:
 
         threading.Thread(target=self.retry_thread, daemon=True).start()
 
-        self.task_queue.join()
-        time.sleep(0.5)
-        self.task_queue.shutdown()
+        try:
+            self.task_queue.join()
+            time.sleep(0.5)
+        except KeyboardInterrupt:
+            logger.warning("收到中断信号，正在停止当前课程任务...")
+            self.chaoxing.request_stop()
+            self.task_queue.shutdown(immediate=True)
+            self.retry_queue.shutdown(immediate=True)
+            raise
+        else:
+            self.task_queue.shutdown()
+            self.retry_queue.shutdown()
 
 
     @log_error
     def worker_thread(self):
         tqdm.set_lock(tqdm.get_lock())
         while True:
+            if self.chaoxing.is_stopped():
+                return
+
             try:
                 task = self.task_queue.get()
             except ShutDown:
@@ -322,6 +337,10 @@ class JobProcessor:
                 return
 
             task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+
+            if self.chaoxing.is_stopped():
+                self.task_queue.task_done()
+                return
 
             match task.result:
                 case ChapterResult.SUCCESS:
@@ -367,16 +386,24 @@ class JobProcessor:
     def retry_thread(self):
         try:
             while True:
+                if self.chaoxing.is_stopped():
+                    return
                 task = self.retry_queue.get()
+                if self.chaoxing.is_stopped():
+                    return
                 self.task_queue.put(task)
                 self.task_queue.task_done() # task_done is not called when a task failed and needs to be retried, so if is reput into the queue, the task num will increase by one and become more than the real task number
-                time.sleep(1)
+                if self.chaoxing.stop_event.wait(1):
+                    return
         except ShutDown:
             pass
 
 
 def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, Any], speed:float) -> ChapterResult:
     """处理单个章节"""
+    if chaoxing.is_stopped():
+        return ChapterResult.ERROR
+
     logger.info(f'当前章节: {point["title"]}')
     if point["has_finished"]:
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
@@ -402,6 +429,8 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     with ThreadPoolExecutor(max_workers=5) as executor:
         for result in executor.map(lambda job: process_job(chaoxing, course, job, job_info, speed), jobs):
             job_results.append(result)
+            if chaoxing.is_stopped():
+                return ChapterResult.ERROR
     
     for result in job_results:
         if result.is_failure():
@@ -413,6 +442,9 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
 
 def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     """处理单个课程"""
+    if chaoxing.is_stopped():
+        return
+
     logger.info(f"开始学习课程: {course['title']}")
     
     # 获取当前课程的所有章节
@@ -422,8 +454,6 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
 
     # 为了支持课程任务回滚, 采用下标方式遍历任务点
 
-    _old_format_sizeof = tqdm.format_sizeof
-    tqdm.format_sizeof = format_time
     tqdm.set_lock(RLock())
 
     tasks=[]
@@ -434,8 +464,6 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     p = JobProcessor(chaoxing, course, tasks, config)
     p.run()
 
-
-    tqdm.format_sizeof = _old_format_sizeof
 
     """
     while __point_index < len(point_list["points"]):
@@ -500,6 +528,8 @@ def format_time(num, suffix='', divisor=''):
 
 def main():
     """主程序入口"""
+    chaoxing = None
+    notification = Notification()
     try:
         # 初始化配置
         common_config, tiku_config, notification_config = init_config()
@@ -512,7 +542,6 @@ def main():
         chaoxing = init_chaoxing(common_config, tiku_config)
         
         # 设置外部通知
-        notification = Notification()
         notification.config_set(notification_config)
         notification = notification.get_notification_from_config()
         notification.init_notification()
@@ -541,7 +570,10 @@ def main():
             logger.error(f"错误: 程序异常退出, 返回码: {e.code}")
         sys.exit(e.code)
     except KeyboardInterrupt as e:
+        if chaoxing is not None:
+            chaoxing.request_stop()
         logger.error(f"错误: 程序被用户手动中断, {e}")
+        sys.exit(130)
     except BaseException as e:
         logger.error(f"错误: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
